@@ -1262,7 +1262,12 @@ class PmapExecutable(stages.XlaExecutable):
                               parts.local_num_partitions, out_parts, aval, out_axis)
           for out_parts, aval, out_axis in safe_zip(
               local_out_parts, local_out_avals, pci.out_axes)]
-      handle_outs = local_avals_to_results_handler(out_specs, local_unmapped_avals)
+      process_index = xb.process_index(pci.backend)
+      local_device_assignment = np.array([
+          d for d in device_assignment.flat if d.process_index == process_index
+      ]).reshape((replicas.num_local_replicas, parts.local_num_partitions))
+      pmap_shardings = _get_pmap_sharding(local_device_assignment, out_specs)
+      handle_outs = local_avals_to_results_handler(local_unmapped_avals, pmap_shardings)
 
     if hasattr(pci.backend, "compile_replicated"):
       execute_fun = pci.backend.compile_replicated(
@@ -1465,11 +1470,11 @@ class ResultsHandler:
   # `out_avals` is the `GlobalDeviceArray` global avals when using pjit or xmap
   # with `config.parallel_functions_output_gda=True`. It is the local one
   # otherwise, and also when using `pmap`.
-  __slots__ = ("handlers", "out_specs", "out_indices", "out_avals")
+  __slots__ = ("handlers", "out_shardings", "out_indices", "out_avals")
 
-  def __init__(self, handlers, out_specs, out_indices, out_avals):
+  def __init__(self, handlers, out_shardings, out_indices, out_avals):
     self.handlers = handlers
-    self.out_specs = out_specs
+    self.out_shardings = out_shardings
     self.out_indices = out_indices
     self.out_avals = out_avals
 
@@ -1477,99 +1482,55 @@ class ResultsHandler:
     return [h(bufs) for h, bufs in safe_zip(self.handlers, out_bufs)]
 
 
+def _get_sharding_specs(
+    shardings: Sequence[XLACompatibleSharding], avals: Sequence[ShapedArray]
+) -> Sequence[ShardingSpec]:
+  from jax.experimental import sharding
+
+  if all(isinstance(s, sharding.PmapSharding) for s in shardings):
+    return [s.sharding_spec for s in shardings]  # type: ignore
+  elif all(isinstance(s, sharding.MeshPspecSharding) for s in shardings):
+    return [mesh_sharding_specs(s.mesh.shape, s.mesh.axis_names)(
+              aval, _get_array_mapping(s.spec))
+            for aval, s in safe_zip(avals, shardings)]
+  else:
+    raise ValueError('Getting sharding spec is only supported for '
+                     'PmapSharding and MeshPspecSharding.')
+
 def local_avals_to_results_handler(
-    local_out_specs: Sequence[Optional[ShardingSpec]],
-    unmapped_local_out_avals: Sequence[Optional[ShapedArray]]):
-  out_indices = [spec_to_indices(aval.shape, spec)
-                 for aval, spec in safe_zip(unmapped_local_out_avals, local_out_specs)]  # pytype: disable=attribute-error
+    unmapped_local_out_avals: Sequence[Optional[ShapedArray]],
+    local_shardings: Sequence[XLACompatibleSharding]):
+  local_out_specs = _get_sharding_specs(local_shardings, unmapped_local_out_avals)
+  out_indices = [tuple(s.devices_indices_map(aval.shape).values())
+                 for s, aval in safe_zip(local_shardings, unmapped_local_out_avals)]
   handlers = [
       local_aval_to_result_handler(aval, spec, idcs)
       for aval, spec, idcs in safe_zip(unmapped_local_out_avals, local_out_specs, out_indices)
   ]
-  return ResultsHandler(handlers, local_out_specs, out_indices, unmapped_local_out_avals)
-
-
-def _get_mesh_sharding_spec_and_avals(
-    shardings: Sequence[MeshPspecSharding], avals: Sequence[ShapedArray],
-    is_global: bool) -> Tuple[Sequence[ShardingSpec], Sequence[ShapedArray]]:
-  global_mesh = shardings[0].mesh
-  if is_global:
-    global_sharding_spec = mesh_sharding_specs(
-        global_mesh.shape, global_mesh.axis_names)
-    return [global_sharding_spec(aval, _get_array_mapping(s.spec))
-            for aval, s in safe_zip(avals, shardings)], avals
-  else:
-    out_axes = [_get_array_mapping(s.spec) for s in shardings]
-    local_sharding_spec = mesh_sharding_specs(
-        global_mesh.local_mesh.shape, global_mesh.axis_names)
-    local_out_untiled_avals = [
-        global_mesh._global_to_local(o, aval)
-        for aval, o in safe_zip(avals, out_axes)
-    ]
-    return [local_sharding_spec(aval, oa)
-            for aval, oa in safe_zip(local_out_untiled_avals, out_axes)], local_out_untiled_avals
-
-
-def _get_sharding_spec_and_avals(
-    shardings: Sequence[XLACompatibleSharding],
-    avals: Sequence[ShapedArray],
-    is_global: bool) -> Tuple[Sequence[ShardingSpec], Sequence[ShapedArray]]:
-  """Returns the sharding spec and the avals required by `ResultsHandler`.
-
-  If `is_global`, then global sharding specs and global avals are returned else
-  host local sharding specs and host local avals are returned.
-  """
-  from jax.experimental import sharding
-
-  if not shardings:
-    return [], []
-
-  if is_global:
-    if config.jax_parallel_functions_output_gda:
-      assert all(isinstance(s, sharding.MeshPspecSharding) for s in shardings)
-      return _get_mesh_sharding_spec_and_avals(
-          cast(Sequence[sharding.MeshPspecSharding], shardings), avals, is_global=True)
-    elif config.jax_array:
-      if all(isinstance(s, sharding.PmapSharding) for s in shardings):
-        # Cast for type checkers. Does not affect runtime.
-        shardings = cast(Sequence[sharding.PmapSharding], shardings)
-        return [s.sharding_spec for s in shardings], avals
-      elif all(isinstance(s, sharding.MeshPspecSharding) for s in shardings):
-        return _get_mesh_sharding_spec_and_avals(
-            cast(Sequence[sharding.MeshPspecSharding], shardings), avals, is_global=True)
-      else:
-        # TODO(b/239098037): Delete `_get_sharding_spec_and_avals` and
-        # _get_mesh_sharding_spec_and_avals. It's ok to return `[]` because
-        # for shardings other than MeshPspecSharding and PmapSharding, they
-        # don't have sharding specs and it doesn't make sense for other
-        # shardings to have that field set.
-        return [], avals
-    else:
-      raise ValueError('Option not recognized. Please file a bug against JAX.')
-  else:
-    assert all(isinstance(s, sharding.MeshPspecSharding) for s in shardings)
-    return _get_mesh_sharding_spec_and_avals(
-        cast(Sequence[sharding.MeshPspecSharding], shardings), avals, is_global=False)
+  return ResultsHandler(handlers, local_shardings, out_indices,
+                        unmapped_local_out_avals)
 
 
 def global_avals_to_results_handler(
     global_out_avals: Sequence[ShapedArray],
     shardings: Sequence[XLACompatibleSharding]):
+  from jax.experimental.sharding import MeshPspecSharding
+
   if config.jax_parallel_functions_output_gda or config.jax_array:
-    global_out_specs, _ = _get_sharding_spec_and_avals(
-        shardings, global_out_avals, is_global=True)
     global_out_indices = [tuple(s.devices_indices_map(aval.shape).values())
                           for s, aval in safe_zip(shardings, global_out_avals)]
     handlers = [
         global_aval_to_result_handler(global_aval, s)
         for global_aval, s in safe_zip(global_out_avals, shardings)
     ]
-    return ResultsHandler(handlers, global_out_specs, global_out_indices,
-                          global_out_avals)
+    return ResultsHandler(handlers, shardings, global_out_indices, global_out_avals)
   else:
-    local_out_specs, local_out_untiled_avals = _get_sharding_spec_and_avals(
-        shardings, global_out_avals, is_global=False)
-    return local_avals_to_results_handler(local_out_specs, local_out_untiled_avals)
+    # This is for type checkers.
+    shardings = cast(Sequence[MeshPspecSharding], shardings)
+    local_out_avals = [s.mesh._global_to_local(_get_array_mapping(s.spec), aval)
+                       for aval, s in safe_zip(global_out_avals, shardings)]
+    local_shardings = [MeshPspecSharding(s.mesh.local_mesh, s.spec) for s in shardings]
+    return local_avals_to_results_handler(local_out_avals, local_shardings)
 
 
 @profiler.annotate_function

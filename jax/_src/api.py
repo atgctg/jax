@@ -2181,7 +2181,7 @@ def _cpp_pmap(
           input_sharding_specs=in_handler.sharding_specs,
           input_devices=in_handler.local_devices,
           input_indices=in_handler.input_indices,
-          out_sharding_specs=out_handler.out_specs,
+          out_sharding_specs=[s.sharding_spec for s in out_handler.out_shardings],
           out_indices=out_handler.out_indices,
           out_avals=out_handler.out_avals,
       )
